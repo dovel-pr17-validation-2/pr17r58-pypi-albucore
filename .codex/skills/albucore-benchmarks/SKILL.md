@@ -1,0 +1,132 @@
+---
+name: albucore-benchmarks
+description: Running Albucore micro-benchmarks under benchmarks/, synthetic router timings, and comparing PyPI releases with uv --no-project. Use when adding benchmarks, comparing performance across versions, or documenting benchmark workflow.
+---
+
+# Albucore Benchmarks
+
+## Albucore benchmark scope
+
+Measure Albucore public operations only, including Core-owned dispatch, conversions, allocations and memory costs.
+AX functional, transform, Compose and DataLoader performance campaigns require an explicit user request and never
+become automatic acceptance gates for Core. Choose a matrix for the affected operations and routing boundaries;
+the canonical guide below defines the detailed scope.
+
+Before designing a performance comparison, read `../performance-optimization/SKILL.md` and
+`../../../docs/performance-optimization.md` completely. Extend the benchmark along the dimension that controls the
+candidate, such as label density for `bincount`, table and channel layout for LUTs, or output size and dtype for random
+generation.
+
+Use Python 3.11 and the latest stable third-party releases compatible with Python 3.11 and the target platform for
+acceptance benchmarks. The recorded 2026-10-31 profile includes PyTorch 2.15.0 (`2.15.0+cpu` on Linux), NumPy 2.4.6,
+OpenCV 5.0.0.93, NumKong 7.8.6, and StringZilla 5.3.2. Re-resolve and record all package versions and imported source
+paths before each acceptance run. `uv run` follows `uv.lock`; verify its resolved profile before using results as
+acceptance evidence.
+
+Use exactly one CPU thread per process for every candidate, following the thread controls in the canonical
+performance guide. Benchmark additional thread counts only when the user explicitly requests thread scaling.
+Record enabled backend/ISA flags and verify the intended host profile before acceptance. A sandbox that denies
+`sysctl` can disable NumKong NEON. On macOS ARM64, invoke local benchmark commands through Codex with
+`sandbox_permissions="require_escalated"` and verify `nk.get_capabilities()["neon"]` is true in the same process. The
+router harness rejects this restricted profile by default; `--allow-restricted-isa` is for diagnostics only. Do not
+force NumKong capabilities to make an acceptance run appear native.
+For dtype comparisons, use the same logical inputs and operation controls; choose floating controls exactly
+representable in float16 when the route is compared across float16 and float32. Do not benchmark an identity route for
+one dtype against real work in another.
+
+Restore the original logical source before each case and storage mode, as well as before every alias sample.
+Assert input preservation after ordinary and separate-output calls. Idempotent operations such as clipping can hide
+an already-mutated benchmark input even when the output comparison passes.
+
+Inspect the installed or selected source API before constructing a workload. Reject unknown or ignored transform
+arguments, verify effective controls, and name the actual caller branch being timed. Matching seeds do not prove that
+a library accepted the requested parameters. Preserve invalid runs as rejected evidence and rerun only affected rows.
+
+## Layout
+
+- `benchmarks/` - Python timing scripts. Run from repo root: `uv run python benchmarks/<script>.py`.
+- `benchmarks/timing.py` - Shared `median_ms` helper for scripts executed as `python benchmarks/foo.py`.
+- `./benchmark.sh` - Dataset-driven runner; expects an external `benchmark` package that is not always present in-tree. Prefer synthetic scripts for CI-style checks.
+- `benchmarks/benchmark_router_synthetic.py` - Times public routers on synthetic `uint8`, `float16`, and `float32` NumPy arrays: HWC, plus NHWC for `mean`, `std`, `mean_std`, and `reduce_sum`. With `--with-geometric`, the grid includes the parameter-specific `remap_nearest` and `warp_perspective_nearest` cases as well as the default linear routes.
+- `benchmarks/benchmark_tensor_router_paired.py` - Interleaves complete eager CPU Tensor float16/float32 router calls on half-quantized inputs across CHW/NCHW/CDHW/NCDHW. Timings include bridge, dispatch, kernel, and output; `--with-geometric` adds geometric routers and volume batches.
+- `benchmarks/benchmark_median_blur.py` - Measures public NumPy `median_blur` across image dtypes, channels, sizes, and kernels; `--with-tensor` adds CHW/NCHW calls and `--with-data-patterns` checks signed-zero and mixed-sign cases.
+- `benchmarks/compare_router_json.py` - Builds a Markdown table from two JSON outputs.
+- `benchmarks/benchmark_resize3d_tensor.py` - Times direct Tensor, zero-copy Tensor→NumPy→Tensor, and public
+  `resize3d` routes for contiguous and channel-last-strided CPU `CDHW` Tensors.
+- `benchmarks/benchmark_warp_affine3d.py` - Times full single-volume NumPy `DHWC` affine paths, including the
+  NumPy→Torch bridge and public router.
+- `benchmarks/benchmark_warp_affine3d_tensor.py` - Times native Torch affine-grid, manual-grid and coverage-fill
+  probes, and public single-volume `CDHW` routing.
+- `benchmarks/benchmark_warp_affine3d_batch.py` and `benchmarks/benchmark_remap3d_batch.py` - Compare full rank-5
+  paths: per-volume calls, `N × C` folding, direct native sampling, public dispatch, and Tensor/NumPy bridges.
+
+## Canonical Shape Grid
+
+Benchmark shape sweeps use channel-last Albucore conventions.
+
+NumPy HWC images, including `uint8`, `float16`, and `float32`:
+
+- `128x160` with 1, 3, 9 channels - small / warm-cache, non-square.
+- `240x320` with 1, 3, 9 channels - mid-size crop, non-square.
+- `480x640` with 1, 3, 9 channels - typical augmentation training crop, non-square.
+- `768x1024` with 1, 3, 9 channels - high-res / full-image pass, non-square.
+
+Use non-square H/W pairs so height-width swaps fail visibly. Avoid square-only benchmark grids.
+
+DHWC volumes:
+
+- `16x128x160x1`, `16x128x160x3` - thin slab, non-square in-plane.
+- `32x128x160x1`, `32x128x160x3` - common nnU-Net patch depth.
+- `64x128x160x3` - deeper slab.
+- `96x128x160x1` - deep single-channel slab.
+- `48x240x320x3` - large in-plane, multi-channel.
+
+For `resize3d`, also include `C=5`, unit input/output spatial axes, and an explicit `D*C` value on both sides of the OpenCV encoded-channel boundary. Time its public NumPy route end-to-end, including channel packing, Torch conversions, and output repair. For Tensor input, sweep contiguous and channel-last-strided `CDHW`, direct interpolation, the zero-copy bridge, and the public router. Use `uv run python benchmarks/benchmark_resize3d.py --quick` and `uv run python benchmarks/benchmark_resize3d_tensor.py --quick` while iterating; record any resulting routing decision in `docs/numkong-performance.md` with a link to external measurements.
+
+For `warp_affine3d`, benchmark both NumPy `DHWC`/`NDHWC` and CPU Tensor `CDHW`/`NCDHW`. The single-volume matrix
+uses uint8/float16/float32, `C=1/3/5/9`, canonical output sizes, nearest/trilinear interpolation, one 3×4 forward matrix,
+and zero/nonzero fill. The batch matrix also varies `N=1/4/16`; compare per-volume calls, `N × C` folding, direct
+native sampling, public batch dispatch, and Tensor/NumPy bridges. Batch scripts time contiguous NumPy inputs;
+correctness tests cover
+supported strided and read-only inputs. Tensor timings include contiguous and channel-last-strided layouts. Test the
+equivalent homogeneous 4×4 representation as a contract.
+Run the single-volume scripts and `benchmark_warp_affine3d_batch.py --quick --threads 1` while developing.
+A manual grid, coverage sampler, tiled route, or native extension remains diagnostic until it has exact correctness
+parity and a sustained full-path win.
+
+`remap3d` uses the same rank-4/rank-5 volume layouts and applies one normalized float32 grid to every batch item. Its
+batch benchmark also checks NumPy and Tensor grid containers independently of the volume container.
+Channel choices: 1 for grayscale, 3 for RGB / 3-channel, and 9 for hyperspectral paths that exceed `MAX_OPENCV_WORKING_CHANNELS=4`.
+
+## Compare the current tree with a previous release
+
+```bash
+uv run python benchmarks/benchmark_router_synthetic.py \
+  --output-json benchmarks/results/router-current.json
+
+uv run --no-project --with albucore==<previous-version> --with opencv-python-headless \
+  --with numkong --with stringzilla --with numpy \
+  python benchmarks/benchmark_router_synthetic.py \
+  --output-json benchmarks/results/router-previous.json
+
+uv run python benchmarks/compare_router_json.py \
+  benchmarks/results/router-current.json \
+  benchmarks/results/router-previous.json \
+  benchmarks/results/REPORT_router_current_vs_previous.md
+```
+
+Replace `<previous-version>` with the release that answers the current question. Use `--quick` for smaller
+shape/channel grids while iterating, and do not accumulate version-specific baselines in the repository.
+
+## Docs
+
+- Current NumKong route decisions: `docs/numkong-performance.md`
+- Generated output: ignored local directories; archive measurements outside Git.
+- General performance policy: `docs/performance-optimization.md`
+
+## Generated benchmark artifacts
+
+Keep generated benchmark reports, CSV/JSON/GZ data, profiler output and run logs outside Git. Local outputs may
+use ignored results directories. Never force-add them, including when publishing a PR or preserving evidence.
+Keep reproducible benchmark code and concise current route decisions in the existing documentation. Preserve raw
+measurements as external artifacts and link them from PR descriptions or the archive index in benchmarks/README.md.
